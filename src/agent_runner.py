@@ -1,15 +1,14 @@
-"""Run a SkillsBench task with a chosen skill bundle and collect reward.
+"""Run one (query, bundle) trial via Harbor and persist a JSONL line.
 
-Mechanism (mirrors evaluation/skillsbench/_allskills_template/docker-compose.yaml):
-the docker-compose file mounts ${SKILLSBENCH_SKILLS_HOST_DIR} into the agent
-container at /opt/skillsbench/skills. By staging a temp directory containing
-ONLY the bundle's skill packages and pointing that env var at it, the agent
-sees exactly the bundle we choose -- no GoS runtime retrieval, no full library
-exposure. This isolates the single experimental knob we care about.
+The bundle is materialized by symlinking each chosen skill package into a
+temp directory, then setting SKILLSBENCH_SKILLS_HOST_DIR so the SkillsBench
+docker-compose mounts it at /opt/skillsbench/skills. The agent therefore sees
+exactly the bundle we picked -- no GoS runtime retrieval, no full library.
 
-The agent itself is invoked via Harbor (https://github.com/harbor-ai/harbor),
-which is what GoS's own SkillsBench runner uses. Reward is the binary
-verifier_result.rewards.reward field in result.json.
+Output schema is fixed by the experiment design:
+  query_id, query, bundle_type, skill_ids, skill_names, ppr_scores,
+  token_count, agent_output, reward, success, execution_time, error_type
+One JSON object per line, appended to results/runs.jsonl.
 """
 
 from __future__ import annotations
@@ -28,49 +27,33 @@ from typing import Any
 
 @dataclass
 class RunRecord:
-    run_id: str
-    query_id: str                    # SkillsBench task name
-    condition: str                   # "default" | "loo:..." | "unrelated_swap:..." | "eps_swap:..."
-    repeat: int
-    bundle: list[str]
-    bundle_size: int
+    query_id: str
+    query: str
+    bundle_type: str                 # "gos_original" | "delete_top" | "add_irrelevant" | "replace_similar"
+    skill_ids: list[str]
+    skill_names: list[str]
+    ppr_scores: list[float]
+    token_count: int | None
+    agent_output: str
     reward: float | None
-    raw_score: dict[str, Any] = field(default_factory=dict)
-    tokens_in: int | None = None
-    tokens_out: int | None = None
-    runtime_s: float | None = None
-    agent_model: str | None = None
-    agent_temperature: float | None = None
-    error: str | None = None
-    started_at: float = field(default_factory=time.time)
+    success: bool
+    execution_time: float
+    error_type: str | None
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
-def _new_run_id() -> str:
-    return uuid.uuid4().hex[:12]
-
-
-def _stage_bundle_skills(
-    bundle: list[str],
-    full_library_dir: Path,
-    stage_root: Path,
-) -> Path:
-    """Materialize a temp skills dir containing only the bundle's packages.
-
-    Uses symlinks to avoid copying large skill assets. Harbor mounts the
-    resulting dir read-only into the agent container.
-    """
-    stage_root.mkdir(parents=True, exist_ok=True)
-    bundle_dir = stage_root / f"bundle_{_new_run_id()}"
-    bundle_dir.mkdir()
+def _stage_bundle(bundle: list[str], full_library_dir: Path) -> Path:
+    """Build a temp dir containing only the bundle's skill packages (symlinks)."""
+    stage = Path(tempfile.mkdtemp(prefix="gos_sanity_"))
     for skill_id in bundle:
         src = full_library_dir / skill_id
         if not src.exists():
+            shutil.rmtree(stage, ignore_errors=True)
             raise FileNotFoundError(
-                f"Skill {skill_id!r} not in {full_library_dir}. "
-                "Bundle contains a name that doesn't match a package directory."
+                f"Skill {skill_id!r} not found in {full_library_dir}"
             )
-        (bundle_dir / skill_id).symlink_to(src.resolve())
-    return bundle_dir
+        (stage / skill_id).symlink_to(src.resolve())
+    return stage
 
 
 def _harbor_run(
@@ -80,21 +63,10 @@ def _harbor_run(
     bundle_skills_dir: Path,
     timeout_s: int,
 ) -> subprocess.CompletedProcess:
-    """Invoke Harbor against a single SkillsBench task with a custom skills mount.
-
-    agent_cfg keys consumed:
-        backend  -> "openai" | "anthropic" -> harbor agent name
-        model    -> e.g. "openai/gpt-5.2-codex"
-    """
-    backend_to_agent = {
-        "openai": "codex",
-        "anthropic": "claude-code",
-        "gemini": "gemini-cli",
-    }
-    agent_name = backend_to_agent.get(agent_cfg["backend"], agent_cfg["backend"])
+    backend_to_agent = {"openai": "codex", "anthropic": "claude-code", "gemini": "gemini-cli"}
     cmd = [
         "harbor", "run",
-        "--agent", agent_name,
+        "--agent", backend_to_agent.get(agent_cfg["backend"], agent_cfg["backend"]),
         "--model", agent_cfg["model"],
         "--force-build",
         "-p", str(task_dir),
@@ -106,100 +78,110 @@ def _harbor_run(
     )
 
 
-def _read_reward(out_dir: Path) -> tuple[float | None, dict]:
-    """Pull verifier_result.rewards.reward and a small diagnostic blob from
-    Harbor's output. Returns (None, {}) if not found.
-    """
+def _read_harbor_result(out_dir: Path) -> dict:
+    """Return verifier_result + agent_result blob from harbor's output.json."""
     candidates = list(out_dir.glob("**/result.json"))
     if not candidates:
-        return None, {}
-    # Per-trial result.json sits one level deep; pick that one if present.
+        return {}
     trial_results = [c for c in candidates if c.parent.parent == out_dir]
     chosen = trial_results[0] if trial_results else candidates[0]
-    payload = json.loads(chosen.read_text())
-    reward = (payload.get("verifier_result") or {}).get("rewards", {}).get("reward")
-    diag = {
-        "result_path": str(chosen),
-        "n_input_tokens": (payload.get("agent_result") or {}).get("n_input_tokens"),
-        "n_output_tokens": (payload.get("agent_result") or {}).get("n_output_tokens"),
-    }
-    return (float(reward) if reward is not None else None), diag
+    return json.loads(chosen.read_text())
 
 
-def run_agent_once(
-    query: str,                         # unused here; kept for interface symmetry
-    query_id: str,                      # SkillsBench task directory name
+def _classify_error(payload: dict, harbor_stderr: str) -> str | None:
+    """Coarse error bucket. None when the run completed and verifier returned a reward."""
+    if payload.get("verifier_result", {}).get("rewards", {}).get("reward") is not None:
+        return None
+    if "Timeout" in harbor_stderr or "timeout" in harbor_stderr.lower():
+        return "agent_timeout"
+    if not payload:
+        return "harbor_no_result"
+    if payload.get("agent_result") is None:
+        return "agent_failed"
+    if payload.get("verifier_result") is None:
+        return "verifier_failed"
+    return "unknown"
+
+
+def run_once(
+    *,
+    query_id: str,
+    query: str,
+    bundle_type: str,
     bundle: list[str],
-    condition: str,
-    repeat: int,
-    library: dict,                      # unused at runtime; kept for symmetry
+    library: dict,                       # skill_id -> SkillRecord (for skill_names)
+    ppr_scores: dict[str, float],
     agent_cfg: dict,
     paths_cfg: dict,
-    results_dir: Path,
+    results_path: Path,
 ) -> RunRecord:
-    """Stage the bundle, run the task, persist a RunRecord."""
+    skill_names = [getattr(library.get(s), "name", s) for s in bundle]
+    bundle_ppr = [float(ppr_scores.get(s, 0.0)) for s in bundle]
+
     record = RunRecord(
-        run_id=_new_run_id(),
         query_id=query_id,
-        condition=condition,
-        repeat=repeat,
-        bundle=list(bundle),
-        bundle_size=len(bundle),
+        query=query,
+        bundle_type=bundle_type,
+        skill_ids=list(bundle),
+        skill_names=skill_names,
+        ppr_scores=bundle_ppr,
+        token_count=None,
+        agent_output="",
         reward=None,
-        agent_model=agent_cfg.get("model"),
-        agent_temperature=agent_cfg.get("temperature"),
+        success=False,
+        execution_time=0.0,
+        error_type=None,
     )
+
     t0 = time.time()
-    stage_root = Path(tempfile.mkdtemp(prefix="gos_sanity_stage_"))
-    bundle_dir = None
+    stage_dir: Path | None = None
     try:
-        bundle_dir = _stage_bundle_skills(
-            bundle,
-            full_library_dir=Path(paths_cfg["skills_library"]).expanduser().resolve(),
-            stage_root=stage_root,
+        stage_dir = _stage_bundle(
+            bundle, Path(paths_cfg["skills_library"]).expanduser().resolve()
         )
-        # The base task directory lives under evaluation/skillsbench/tasks/<name>/.
-        # We deliberately use the allskills-style template path so the agent has
-        # no runtime retrieval -- the mounted skills dir IS the bundle.
         task_dir = (
             Path(paths_cfg["skillsbench_tasks"]).expanduser().resolve() / query_id
         )
         if not task_dir.exists():
-            raise FileNotFoundError(f"SkillsBench task not found: {task_dir}")
+            raise FileNotFoundError(f"SkillsBench task missing: {task_dir}")
 
-        out_dir = results_dir / "harbor_jobs" / f"{query_id}__{condition}__r{repeat}__{record.run_id}"
+        out_dir = Path(paths_cfg["results_dir"]) / "harbor_jobs" / f"{query_id}__{bundle_type}__{record.run_id}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         proc = _harbor_run(
-            task_dir=task_dir,
-            out_dir=out_dir,
-            agent_cfg=agent_cfg,
-            bundle_skills_dir=bundle_dir,
-            timeout_s=int(agent_cfg.get("timeout_s", 600)),
+            task_dir, out_dir, agent_cfg, stage_dir,
+            timeout_s=int(agent_cfg.get("timeout_s", 1800)),
         )
-        if proc.returncode != 0:
-            record.error = f"harbor exit {proc.returncode}: {proc.stderr[-2000:]}"
+        payload = _read_harbor_result(out_dir)
+        rewards = payload.get("verifier_result", {}).get("rewards", {})
+        agent_result = payload.get("agent_result", {}) or {}
 
-        reward, diag = _read_reward(out_dir)
-        record.reward = reward
-        record.raw_score = diag
-        record.tokens_in = diag.get("n_input_tokens")
-        record.tokens_out = diag.get("n_output_tokens")
+        record.reward = (
+            float(rewards["reward"]) if rewards.get("reward") is not None else None
+        )
+        record.success = bool(record.reward and record.reward > 0)
+        record.token_count = (
+            (agent_result.get("n_input_tokens") or 0) + (agent_result.get("n_output_tokens") or 0)
+        ) or None
+        record.agent_output = (agent_result.get("final_output") or "")[:8000]
+        record.error_type = _classify_error(payload, proc.stderr)
+
     except subprocess.TimeoutExpired:
-        record.error = "harbor timed out"
-    except Exception as exc:                       # noqa: BLE001
-        record.error = repr(exc)
+        record.error_type = "agent_timeout"
+    except FileNotFoundError as exc:
+        record.error_type = f"missing:{exc}"
+    except Exception as exc:                           # noqa: BLE001
+        record.error_type = f"exception:{type(exc).__name__}:{exc}"
     finally:
-        record.runtime_s = time.time() - t0
-        if bundle_dir is not None:
-            shutil.rmtree(stage_root, ignore_errors=True)
-        _flush(record, results_dir)
+        record.execution_time = time.time() - t0
+        if stage_dir is not None:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        _append_jsonl(record, results_path)
 
     return record
 
 
-def _flush(record: RunRecord, results_dir: Path) -> None:
-    runs_dir = results_dir / "runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    out = runs_dir / f"{record.query_id}__{record.condition}__r{record.repeat}__{record.run_id}.json"
-    out.write_text(json.dumps(asdict(record), indent=2))
+def _append_jsonl(record: RunRecord, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")

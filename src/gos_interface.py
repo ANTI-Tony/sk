@@ -1,12 +1,11 @@
 """Wrapper around the GoS retrieval pipeline at github.com/davidliuk/graph-of-skills.
 
-Three calls expose what the rest of the project needs as plain Python types:
-    load_library         -> {skill_id: SkillRecord}
-    retrieve_default_bundle -> (bundle: list[str], rho: dict[str, float])
-    embed                -> np.ndarray (unit-normalized)
+Two calls expose what the rest of the project needs:
+    load_library(gos_repo, library_path) -> {skill_id: SkillRecord}
+    retrieve(query, ...)                 -> (bundle, ppr_scores) where ppr is full-library
 
-Field mapping matches gos.core.schema.SkillNode (raw_content + domain_tags
-newline-separated string, with domain_tags_list for the parsed view).
+This module is the only place that imports gos.* — keep it that way so the
+rest of the code stays in plain Python types.
 """
 
 from __future__ import annotations
@@ -20,31 +19,35 @@ import numpy as np
 from .perturbations import SkillRecord
 
 
-_FULL_LIBRARY_TOP_N = 10_000          # large enough to score every node in the 200/2000 libraries
-_FULL_LIBRARY_CONTEXT_CHARS = 10**9   # disable context-budget pruning so we get the dense PPR vector
+_FULL_TOPN = 10_000
+_FULL_CTX_CHARS = 10**9
 
 
 def _ensure_gos_on_path(gos_repo: str | Path) -> None:
     p = Path(gos_repo).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(
-            f"GoS repo not found at {p}. Run: "
+            f"GoS repo not found at {p}. "
             "git clone https://github.com/davidliuk/graph-of-skills"
         )
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
 
-def _build_rag(gos_repo: str | Path, workspace: str | Path) -> object:
-    """Construct a SkillGraphRAG against a prebuilt or freshly-indexed workspace.
+def _run(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            return asyncio.run_coroutine_threadsafe(coro, loop).result()
+    except RuntimeError:
+        pass
+    return asyncio.run(coro)
 
-    Embedding model and LLM service come from env (see gos.core.engine
-    build_default_*). enable_query_rewrite=False keeps retrieval deterministic
-    on the raw query, matching the experiment described in the GoS paper sec 4.1.
-    """
+
+def _build_rag(gos_repo: str | Path, workspace: str | Path):
     _ensure_gos_on_path(gos_repo)
-    from gos import SkillGraphRAG                                          # type: ignore
-    from gos.core.engine import (                                          # type: ignore
+    from gos import SkillGraphRAG                                         # type: ignore
+    from gos.core.engine import (                                         # type: ignore
         build_default_embedding_service,
         build_default_llm_service,
     )
@@ -62,122 +65,85 @@ def _build_rag(gos_repo: str | Path, workspace: str | Path) -> object:
     )
 
 
-def _run(coro):
-    """Run an async coro from sync code without leaking event loops."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return asyncio.run_coroutine_threadsafe(coro, loop).result()
-    except RuntimeError:
-        pass
-    return asyncio.run(coro)
-
-
 def load_library(gos_repo: str | Path, library_path: str | Path) -> dict[str, SkillRecord]:
-    """Parse skill packages on disk into SkillRecords.
-
-    library_path points to data/skillsets/skills_200 (a directory of skill
-    package subdirs). Embeddings come from build_default_embedding_service so
-    cosine values are comparable to GoS's own seed scoring.
-    """
+    """Parse skill packages on disk into SkillRecords. Embedding model matches GoS."""
     _ensure_gos_on_path(gos_repo)
-    from gos.core.engine import build_default_embedding_service             # type: ignore
-    from gos.core.parsing import parse_skill_document                       # type: ignore
+    from gos.core.engine import build_default_embedding_service           # type: ignore
+    from gos.core.parsing import parse_skill_document                     # type: ignore
 
-    library_path = Path(library_path).expanduser().resolve()
-    if not library_path.exists():
+    lib = Path(library_path).expanduser().resolve()
+    if not lib.exists():
         raise FileNotFoundError(
-            f"Skill library not found at {library_path}. Run "
-            "scripts/download_data.sh --skillsets in the GoS repo."
+            f"Skill library not found: {lib}. "
+            "Download via GoS scripts/download_data.sh --skillsets"
         )
 
     embedder = build_default_embedding_service()
-    records: dict[str, SkillRecord] = {}
+    pending: list[tuple[str, str, str]] = []   # (skill_id, name, primary_tag)
+    texts: list[str] = []
 
-    skill_dirs = [p for p in library_path.iterdir() if p.is_dir()]
-    skill_dirs.sort()
-    texts_for_embedding: list[str] = []
-    pending: list[tuple[str, str]] = []   # (skill_id, primary_tag)
-
-    for sd in skill_dirs:
+    for sd in sorted(p for p in lib.iterdir() if p.is_dir()):
         spec = sd / "SKILL.md"
         if not spec.exists():
             continue
         parsed = parse_skill_document(spec.read_text())
         if parsed is None:
             continue
-        # parse_skill_document returns a SkillNode-like dict; field names
-        # follow gos.core.schema.SkillNode. Be defensive about missing fields.
         name = getattr(parsed, "name", None) or sd.name
-        domain_raw = getattr(parsed, "domain_tags", "") or ""
-        primary_tag = domain_raw.split("\n", 1)[0].strip() or "_unknown"
-        text_for_embedding = (
-            getattr(parsed, "one_line_capability", "") or ""
-        ) + "\n" + (getattr(parsed, "description", "") or "")
-        texts_for_embedding.append(text_for_embedding.strip() or name)
-        pending.append((name, primary_tag))
+        primary_tag = (getattr(parsed, "domain_tags", "") or "").split("\n", 1)[0].strip() or "_unknown"
+        text = ((getattr(parsed, "one_line_capability", "") or "")
+                + "\n" + (getattr(parsed, "description", "") or "")).strip() or name
+        pending.append((sd.name, name, primary_tag))
+        texts.append(text)
 
-    # Batch embed for throughput; embedder.encode returns a list-like of vectors.
-    vectors = _run(embedder.encode(texts_for_embedding))
-    arr = np.asarray(vectors, dtype=np.float32)
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    vecs = np.asarray(_run(embedder.encode(texts)), dtype=np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
-    arr = arr / norms
+    vecs = vecs / norms
 
-    for (skill_id, tag), vec in zip(pending, arr):
-        records[skill_id] = SkillRecord(skill_id=skill_id, embedding=vec, domain_tag=tag)
+    return {
+        sid: SkillRecord(skill_id=sid, name=name, embedding=v, domain_tag=tag)
+        for (sid, name, tag), v in zip(pending, vecs)
+    }
 
-    return records
 
-
-def retrieve_default_bundle(
+def retrieve(
     query: str,
-    library: dict[str, SkillRecord],
-    retrieval_cfg: dict,
     gos_repo: str | Path,
     workspace: str | Path,
+    top_n: int = 8,
+    max_context_chars: int = 32_000,
 ) -> tuple[list[str], dict[str, float]]:
-    """Run GoS twice: once under production budget for the default bundle, once
-    with effectively unbounded budget so we get PPR scores for the full
-    library (needed by epsilon_neighbor_swap).
-
-    The personalization vector and PPR computation depend only on (query,
-    nodes, edges) so per-skill scores are identical between the two calls.
+    """Run GoS twice: production budget for the bundle, unbounded for full-library
+    PPR scores (needed by replace_similar to find PPR-neighbor candidates).
     """
     rag = _build_rag(gos_repo, workspace)
-
-    bundle_result = _run(rag.async_retrieve(
-        query,
-        top_n=retrieval_cfg.get("top_n", 8),
-        max_context_chars=retrieval_cfg.get("context_budget_tokens", 8000) * 4,  # rough char proxy
+    bundle_res = _run(rag.async_retrieve(
+        query, top_n=top_n, max_context_chars=max_context_chars,
     ))
-    bundle = [s.name for s in bundle_result.skills]
+    bundle = [s.name for s in bundle_res.skills]
 
-    full_result = _run(rag.async_retrieve(
-        query,
-        top_n=_FULL_LIBRARY_TOP_N,
-        max_context_chars=_FULL_LIBRARY_CONTEXT_CHARS,
+    full_res = _run(rag.async_retrieve(
+        query, top_n=_FULL_TOPN, max_context_chars=_FULL_CTX_CHARS,
     ))
-    rho = {s.name: float(s.score) for s in full_result.skills}
+    ppr = {s.name: float(s.score) for s in full_res.skills}
 
-    # Sanity: every default-bundle skill should also appear in the full result.
-    missing = set(bundle) - set(rho)
+    missing = set(bundle) - set(ppr)
     if missing:
         raise RuntimeError(
-            f"PPR coverage gap: {len(missing)} default-bundle skills missing from full retrieval. "
-            "Bump _FULL_LIBRARY_TOP_N or _FULL_LIBRARY_CONTEXT_CHARS."
+            f"PPR coverage gap: {len(missing)} skills in default bundle missing from full retrieval. "
+            "Bump _FULL_TOPN or _FULL_CTX_CHARS."
         )
 
-    return bundle, rho
+    return bundle, ppr
 
 
-def embed(text: str, gos_repo: str | Path) -> np.ndarray:
-    """Embed a query using the same service as the skill index. Unit-normalized."""
+def embed_query(text: str, gos_repo: str | Path) -> np.ndarray:
+    """Unit-normalized query embedding using GoS's embedding service."""
     _ensure_gos_on_path(gos_repo)
-    from gos.core.engine import build_default_embedding_service             # type: ignore
+    from gos.core.engine import build_default_embedding_service           # type: ignore
 
     embedder = build_default_embedding_service()
-    vec = _run(embedder.encode([text]))
-    arr = np.asarray(vec, dtype=np.float32)[0]
-    n = float(np.linalg.norm(arr))
-    return arr if n == 0 else arr / n
+    v = np.asarray(_run(embedder.encode([text])), dtype=np.float32)[0]
+    n = float(np.linalg.norm(v))
+    return v if n == 0 else v / n

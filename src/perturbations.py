@@ -1,17 +1,13 @@
-"""Three perturbation generators for the GoS bundle-sensitivity study.
+"""Three perturbations of a GoS-retrieved skill bundle.
 
-A "bundle" is a list of skill IDs (strings). The skill library is a dict
-mapping skill_id -> {embedding, domain_tag, ...metadata}. Rho scores come
-from the upstream GoS retrieval and are passed in as a dict skill_id -> float.
-
-Each generator returns a list of (label, perturbed_bundle) pairs so the
-caller can name the result for logging.
+Each function returns ONE perturbed bundle (or None if no candidate exists).
+Caller pairs them up with the original bundle to form the 4 conditions per
+query: gos_original, delete_top, add_irrelevant, replace_similar.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 
@@ -19,116 +15,86 @@ import numpy as np
 @dataclass(frozen=True)
 class SkillRecord:
     skill_id: str
+    name: str
     embedding: np.ndarray            # unit-normalized
     domain_tag: str
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))       # assumes unit-normalized inputs
+    return float(np.dot(a, b))
 
 
-def leave_one_out(bundle: list[str]) -> list[tuple[str, list[str]]]:
-    """Drop each skill in turn. Returns |B| perturbed bundles."""
-    return [
-        (f"loo:{dropped}", [s for s in bundle if s != dropped])
-        for dropped in bundle
-    ]
+def delete_top(bundle: list[str], ppr_scores: dict[str, float]) -> list[str]:
+    """Drop the highest-PPR skill in the bundle.
+
+    Hypothesis: if GoS's top pick is load-bearing, removing it should hurt
+    reward. Invariant when the agent doesnt actually rely on the top skill.
+    """
+    if not bundle:
+        return []
+    top = max(bundle, key=lambda s: ppr_scores.get(s, float("-inf")))
+    return [s for s in bundle if s != top]
 
 
-def unrelated_swap(
+def add_irrelevant(
     bundle: list[str],
     library: dict[str, SkillRecord],
     query_embedding: np.ndarray,
-    bundle_skill_to_replace: str,
-    cosine_max: float = 0.25,
-    require_different_domain_tag: bool = True,
+    cosine_max: float = 0.20,
     rng: np.random.Generator | None = None,
-) -> tuple[str, list[str]] | None:
-    """Replace one bundle skill with a skill that is unrelated to the query.
+) -> list[str] | None:
+    """Append one randomly-chosen skill that is semantically far from the query.
 
-    "Unrelated" = cosine(query, skill) <= cosine_max AND optionally a domain
-    tag different from every skill currently in the bundle. Returns None if
-    no candidate exists (caller should log and skip).
+    Tests "is the bundle hurt by adding noise?" — if reward is invariant the
+    agent is robust to irrelevant context (or context just doesnt matter).
     """
     rng = rng or np.random.default_rng()
-    bundle_tags = {library[s].domain_tag for s in bundle if s in library}
-
-    candidates = []
-    for sid, rec in library.items():
-        if sid in bundle:
-            continue
-        if _cosine(query_embedding, rec.embedding) > cosine_max:
-            continue
-        if require_different_domain_tag and rec.domain_tag in bundle_tags:
-            continue
-        candidates.append(sid)
-
+    bundle_set = set(bundle)
+    candidates = [
+        sid for sid, rec in library.items()
+        if sid not in bundle_set and _cosine(query_embedding, rec.embedding) <= cosine_max
+    ]
     if not candidates:
         return None
-
     chosen = str(rng.choice(candidates))
-    new_bundle = [chosen if s == bundle_skill_to_replace else s for s in bundle]
-    return (f"unrelated_swap:{bundle_skill_to_replace}->{chosen}", new_bundle)
+    return list(bundle) + [chosen]
 
 
-def epsilon_neighbor_swap(
+def replace_similar(
     bundle: list[str],
-    rho_scores: dict[str, float],
-    bundle_skill_to_replace: str,
-    rho_epsilon: float = 0.05,
-    must_be_outside_topk: bool = True,
+    ppr_scores: dict[str, float],
     rng: np.random.Generator | None = None,
-) -> tuple[str, list[str]] | None:
-    """Replace one bundle skill with a skill whose rho score is within epsilon
-    of the replaced skill but was NOT chosen by GoS.
+    rho_epsilon: float = 0.001,
+) -> tuple[list[str], str, str] | None:
+    """Pick a random bundle skill and swap it with its nearest non-bundle PPR
+    neighbor (within rho_epsilon).
 
-    Tests whether GoS's ranking carries fine-grained signal beyond a coarse
-    above-threshold cut. If reward is invariant to this swap, the surrogate
-    has nothing to learn.
+    The diagnostic perturbation: if reward is invariant to swapping in a
+    PPR-equivalent skill, GoSs ranking has no fine-grained signal above the
+    bundle-cutoff threshold, and surrogate modeling has nothing to learn from.
+
+    Returns (new_bundle, swapped_out, swapped_in) or None if no neighbor found.
     """
     rng = rng or np.random.default_rng()
-    target_rho = rho_scores.get(bundle_skill_to_replace)
+    if not bundle:
+        return None
+
+    # Pick which bundle skill to replace, then find its PPR-nearest non-bundle peer.
+    bundle_set = set(bundle)
+    target = str(rng.choice(bundle))
+    target_rho = ppr_scores.get(target)
     if target_rho is None:
         return None
 
-    bundle_set = set(bundle)
-    candidates = []
-    for sid, rho in rho_scores.items():
-        if must_be_outside_topk and sid in bundle_set:
-            continue
-        if abs(rho - target_rho) > rho_epsilon:
-            continue
-        candidates.append(sid)
-
+    candidates = [
+        (sid, rho) for sid, rho in ppr_scores.items()
+        if sid not in bundle_set and abs(rho - target_rho) <= rho_epsilon
+    ]
     if not candidates:
         return None
 
-    chosen = str(rng.choice(candidates))
-    new_bundle = [chosen if s == bundle_skill_to_replace else s for s in bundle]
-    return (f"eps_swap:{bundle_skill_to_replace}->{chosen}", new_bundle)
-
-
-def generate_all(
-    bundle: list[str],
-    library: dict[str, SkillRecord],
-    rho_scores: dict[str, float],
-    query_embedding: np.ndarray,
-    cosine_max: float = 0.25,
-    rho_epsilon: float = 0.05,
-    rng: np.random.Generator | None = None,
-) -> list[tuple[str, list[str]]]:
-    """Convenience: generate one perturbation of each non-LOO type per bundle
-    skill, plus full leave-one-out. Caller decides which to actually run.
-    """
-    rng = rng or np.random.default_rng()
-    out: list[tuple[str, list[str]]] = list(leave_one_out(bundle))
-
-    for sid in bundle:
-        u = unrelated_swap(bundle, library, query_embedding, sid, cosine_max, rng=rng)
-        if u is not None:
-            out.append(u)
-        e = epsilon_neighbor_swap(bundle, rho_scores, sid, rho_epsilon, rng=rng)
-        if e is not None:
-            out.append(e)
-
-    return out
+    # Take the absolute-closest, with random tie break.
+    candidates.sort(key=lambda x: (abs(x[1] - target_rho), rng.random()))
+    chosen = candidates[0][0]
+    new_bundle = [chosen if s == target else s for s in bundle]
+    return new_bundle, target, chosen
