@@ -1,8 +1,8 @@
 """Run the three perturbation families on each query's default bundle.
 
-Run AFTER scripts/run_baseline.py has produced sigma_within. If sigma is too
-large, fix that first — perturbation runs without a noise floor are wasted
-compute.
+Run AFTER scripts/run_baseline.py has produced sigma_within. The default
+bundle and rho scores come from results/default_bundles.json (written by the
+baseline script) so we don't pay for a second GoS retrieval per query.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import yaml
 from tqdm import tqdm
 
 from src.agent_runner import run_agent_once
-from src.gos_interface import embed, load_library, retrieve_default_bundle
+from src.gos_interface import embed, load_library
 from src.perturbations import (
     epsilon_neighbor_swap,
     leave_one_out,
@@ -37,20 +37,27 @@ def main() -> None:
 
     library = load_library(cfg["paths"]["gos_repo"], cfg["paths"]["skills_library"])
     K = prereg["sample_size"]["repeats_perturbation"]
-    results_dir = Path(cfg["paths"]["results_dir"])
-    rng = np.random.default_rng(prereg.get("study_id", "seed").__hash__() & 0xFFFFFFFF)
+    results_dir = Path(cfg["paths"]["results_dir"]).expanduser().resolve()
+    bundle_cache_path = results_dir / "default_bundles.json"
+    if not bundle_cache_path.exists():
+        raise SystemExit(
+            "Missing results/default_bundles.json. Run scripts/run_baseline.py first."
+        )
+    bundle_cache = json.loads(bundle_cache_path.read_text())
+    rng = np.random.default_rng(abs(hash(prereg.get("study_id", "seed"))) & 0xFFFFFFFF)
 
     pcfg = cfg["perturbations"]
     for q in tqdm(queries, desc="queries"):
-        bundle, rho = retrieve_default_bundle(
-            q["prompt"], library, cfg["retrieval"], cfg["paths"]["gos_repo"]
-        )
-        q_emb = embed(q["prompt"])
+        cached = bundle_cache.get(q["id"])
+        if cached is None:
+            print(f"WARN: no cached bundle for {q['id']}, skipping")
+            continue
+        bundle: list[str] = cached["bundle"]
+        rho: dict[str, float] = cached["rho"]
+        q_emb = embed(q["prompt"], cfg["paths"]["gos_repo"])
 
-        # 1) leave-one-out: |B| perturbations
         loo_pairs = leave_one_out(bundle)
 
-        # 2) unrelated swap: one per bundle skill (skip if no candidate)
         unrel_pairs = []
         for sid in bundle:
             res = unrelated_swap(
@@ -62,7 +69,6 @@ def main() -> None:
             if res is not None:
                 unrel_pairs.append(res)
 
-        # 3) epsilon-neighbor swap: one per bundle skill (skip if no candidate)
         eps_pairs = []
         for sid in bundle:
             res = epsilon_neighbor_swap(
@@ -84,6 +90,7 @@ def main() -> None:
                     repeat=k,
                     library=library,
                     agent_cfg=cfg["agent"],
+                    paths_cfg=cfg["paths"],
                     results_dir=results_dir,
                 )
 

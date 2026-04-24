@@ -66,7 +66,7 @@ def unrelated_swap(
     if not candidates:
         return None
 
-    chosen = rng.choice(candidates)
+    chosen = str(rng.choice(candidates))
     new_bundle = [chosen if s == bundle_skill_to_replace else s for s in bundle]
     return (f"unrelated_swap:{bundle_skill_to_replace}->{chosen}", new_bundle)
 
@@ -103,7 +103,7 @@ def epsilon_neighbor_swap(
     if not candidates:
         return None
 
-    chosen = rng.choice(candidates)
+    chosen = str(rng.choice(candidates))
     new_bundle = [chosen if s == bundle_skill_to_replace else s for s in bundle]
     return (f"eps_swap:{bundle_skill_to_replace}->{chosen}", new_bundle)
 

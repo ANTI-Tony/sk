@@ -3,53 +3,56 @@
 # affecting the decision rule lives there; anything affecting only how runs
 # are executed lives here.
 #
+# One-time setup (do this in the GoS clone, not in this repo):
+#   git clone https://github.com/davidliuk/graph-of-skills ../graph-of-skills
+#   cd ../graph-of-skills
+#   uv sync
+#   ./scripts/download_data.sh                  # skill libraries + tasks + prebuilt workspace
+#   uv tool install harbor                       # SkillsBench task runner
+#   # Docker (or OrbStack) must be running before any agent invocation.
+#
 
 paths:
-  gos_repo: ../graph-of-skills           # clone target; integrate via gos_interface.py
-  skills_library: ../graph-of-skills/data/skills_200
-  skillsbench_tasks: ../graph-of-skills/data/skillsbench
+  gos_repo: ../graph-of-skills
+  skills_library: ../graph-of-skills/data/skillsets/skills_200
+  gos_workspace: ../graph-of-skills/data/gos_workspace/skills_200_v1
+  skillsbench_tasks: ../graph-of-skills/evaluation/skillsbench/tasks
   results_dir: ./results
 
 retrieval:
-  # GoS hyperparameters held fixed across the experiment so any reward delta
-  # can be attributed to bundle composition, not retrieval-time settings.
-  eta: 0.5                               # semantic vs lexical mix in seed scoring (eq 2)
-  alpha: 0.15                            # PPR restart probability (eq 4)
-  ppr_iters: 30
-  mu: 0.3                                # local grounding weight in rerank (eq 5)
-  lambda_dep: 0.4
-  lambda_wf: 0.3
-  lambda_sem: 0.2
-  lambda_alt: 0.1
-  gamma_reverse: 1.0                     # uniform reverse weight across relation types
-  context_budget_tokens: 8000            # tau in eq 1; smaller value forces retrieval to bind on N=200
+  # Hyperparameters held fixed across the experiment so any reward delta is
+  # attributable to bundle composition, not retrieval-time settings. The
+  # SkillGraphRAG.Config defaults are used for everything not listed here;
+  # the values below are the levers we actively touch.
+  top_n: 8                                # default bundle size; matches SkillsBench gos template defaults
+  context_budget_tokens: 8000             # tau in eq 1; smaller value forces retrieval to bind on N=200
 
 agent:
-  backend: openai                        # one of: openai, anthropic, local_vllm
-  model: gpt-5.2-codex                   # primary per preregistration
-  temperature: 0.0                       # remove decoding noise; sigma_within isolates non-decoding stochasticity
+  backend: openai                         # one of: openai, anthropic, gemini -> Harbor agent name
+  model: openai/gpt-5.2-codex             # primary per preregistration
+  temperature: 0.0                        # remove decoding noise; sigma_within isolates non-decoding stochasticity
   max_tokens: 4096
-  timeout_s: 600
-  retries_on_infra_failure: 2            # matches GoS paper protocol (sec 4.1)
+  timeout_s: 1800                         # SkillsBench tasks include container boot + agent loop
+  retries_on_infra_failure: 2
 
 queries:
   selection_seed: 20260424
   count: 20
-  source: skillsbench                    # pull from full SkillsBench task set
-  stratify_by: domain_tag                # ensure coverage across SkillsBenchs 11 domains
+  source: skillsbench
+  stratify_by: heuristic_keyword          # see scripts/select_queries.py::_infer_stratum
 
 perturbations:
   unrelated_swap:
-    cosine_max: 0.25                     # candidate must have cosine(query, skill) below this
+    cosine_max: 0.25                      # candidate must have cosine(query, skill) below this
     require_different_domain_tag: true
     n_swaps_per_bundle: 1
   epsilon_neighbor_swap:
-    rho_epsilon: 0.05                    # candidate rho score within +/- this of swapped-out skill
-    must_be_outside_topk: true           # exclude skills already in default bundle
+    rho_epsilon: 0.001                    # PPR scores are normalized to sum=1; epsilon is on that scale
+    must_be_outside_topk: true
     n_swaps_per_bundle: 1
   leave_one_out:
-    drop_each: true                      # drop every skill in turn; |B| runs per query
+    drop_each: true                       # drop every skill in turn; |B| runs per query
 
 logging:
-  per_run_json: true                     # one file per (query, condition, repeat)
-  flush_every_run: true                  # crash-safe; A100 jobs can preempt
+  per_run_json: true
+  flush_every_run: true
