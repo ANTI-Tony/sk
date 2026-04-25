@@ -90,7 +90,9 @@ def load_library(gos_repo: str | Path, library_path: str | Path) -> dict[str, Sk
         if parsed is None:
             continue
         name = getattr(parsed, "name", None) or sd.name
-        primary_tag = (getattr(parsed, "domain_tags", "") or "").split("\n", 1)[0].strip() or "_unknown"
+        # ParsedSkillDocument.domain_tags is list[str]
+        tags = getattr(parsed, "domain_tags", None) or []
+        primary_tag = (tags[0].strip() if tags else "") or "_unknown"
         text = ((getattr(parsed, "one_line_capability", "") or "")
                 + "\n" + (getattr(parsed, "description", "") or "")).strip() or name
         pending.append((sd.name, name, primary_tag))
