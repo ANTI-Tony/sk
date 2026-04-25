@@ -4,7 +4,8 @@
 # run a 4-rollout smoke test, then estimate the cost of the full 80-run sanity check.
 #
 # Usage:
-#   bash setup_and_smoke.sh <ANTHROPIC_API_KEY>
+#   bash setup_and_smoke.sh                # uses keys baked in below
+#   bash setup_and_smoke.sh <ANTHROPIC_KEY> [<OPENAI_KEY>]   # override
 #
 # Layout assumed (auto-detected from script location):
 #   <SK_EX_ROOT>/gos-sanity/setup_and_smoke.sh    (this file)
@@ -15,14 +16,45 @@
 
 set -euo pipefail
 
-# --- args ---
-if [ $# -lt 1 ]; then
-    echo "Usage: bash setup_and_smoke.sh <ANTHROPIC_API_KEY>" >&2
+# --- key resolution: arg > env > .env.local ---
+SCRIPT_DIR_FOR_ENV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR_FOR_ENV/.env.local"
+if [ -f "$ENV_FILE" ]; then
+    set -a; source "$ENV_FILE"; set +a
+    echo "Loaded keys from $ENV_FILE"
+fi
+
+API_KEY="${1:-${ANTHROPIC_API_KEY:-}}"
+OPENAI_KEY="${2:-${OPENAI_API_KEY:-}}"
+
+if [ -z "$API_KEY" ] || [ -z "$OPENAI_KEY" ]; then
+    cat >&2 <<EOF
+ERROR: missing API keys. Three ways to provide them:
+
+  1. As args (good for one-off):
+     bash setup_and_smoke.sh '<anthropic_key>' '<openai_key>'
+
+  2. As env vars (good for current shell):
+     export ANTHROPIC_API_KEY=sk-ant-...
+     export OPENAI_API_KEY=sk-...
+     bash setup_and_smoke.sh
+
+  3. As $ENV_FILE (one-time per machine; gitignored):
+     cat > $ENV_FILE <<KEYS
+     ANTHROPIC_API_KEY=sk-ant-...
+     OPENAI_API_KEY=sk-...
+     KEYS
+     bash setup_and_smoke.sh
+EOF
     exit 1
 fi
-API_KEY="$1"
+
 if ! [[ "$API_KEY" =~ ^sk-ant- ]]; then
-    echo "ERROR: API key must start with 'sk-ant-'." >&2
+    echo "ERROR: ANTHROPIC key must start with 'sk-ant-'." >&2
+    exit 1
+fi
+if ! [[ "$OPENAI_KEY" =~ ^sk- ]]; then
+    echo "ERROR: OPENAI key must start with 'sk-'." >&2
     exit 1
 fi
 
@@ -79,17 +111,19 @@ else
 fi
 
 # ============================================================
-step 2 "Set ANTHROPIC_API_KEY in this shell + persist"
+step 2 "Set ANTHROPIC_API_KEY + OPENAI_API_KEY in this shell + persist"
 # ============================================================
 export ANTHROPIC_API_KEY="$API_KEY"
 export ANTHROPIC_AUTH_TOKEN="$API_KEY"
+export OPENAI_API_KEY="$OPENAI_KEY"
 
 if ! grep -q "ANTHROPIC_API_KEY=" "$PROFILE" 2>/dev/null; then
     cat >> "$PROFILE" <<EOF
 export ANTHROPIC_API_KEY='$API_KEY'
 export ANTHROPIC_AUTH_TOKEN='$API_KEY'
+export OPENAI_API_KEY='$OPENAI_KEY'
 EOF
-    echo "Added ANTHROPIC_API_KEY to $PROFILE"
+    echo "Added API keys to $PROFILE"
 else
     echo "$PROFILE already has ANTHROPIC_API_KEY (not overwriting)"
 fi

@@ -14,7 +14,7 @@ paths:
   skills_library: ../graph-of-skills/data/skillsets/skills_200
   gos_workspace: ../graph-of-skills/data/gos_workspace/skills_200_v1
   skillsbench_tasks: ../graph-of-skills/evaluation/skillsbench/tasks
-  results_dir: ./results
+  results_dir: /tmp/gos-sanity-results    # outside any iCloud-synced dir; survives across reruns
 
 retrieval:
   top_n: 8                              # default GoS bundle size
