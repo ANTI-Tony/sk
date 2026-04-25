@@ -204,10 +204,15 @@ fi
 source .venv/bin/activate
 pip install --quiet --upgrade pip
 pip install --quiet -e .
-pip install --quiet -e "$GOS_DIR" || {
-    echo "WARN: pip install -e graph-of-skills failed; using PYTHONPATH fallback"
-    export PYTHONPATH="$GOS_DIR:${PYTHONPATH:-}"
-}
+if ! pip install --quiet -e "$GOS_DIR" 2>/tmp/gos_install.log; then
+    echo "WARN: standard install failed; retrying with --ignore-requires-python"
+    cat /tmp/gos_install.log | tail -5
+    if ! pip install --quiet -e "$GOS_DIR" --ignore-requires-python 2>>/tmp/gos_install.log; then
+        echo "WARN: still failing; installing core GoS deps directly"
+        pip install --quiet loguru fast-graphrag pydantic litellm openai anthropic tiktoken
+        export PYTHONPATH="$GOS_DIR:${PYTHONPATH:-}"
+    fi
+fi
 
 # ============================================================
 step 7 "Pick query + truncate to 1 for smoke test"
