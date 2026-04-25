@@ -22,7 +22,7 @@ retrieval:
 
 agent:
   backend: anthropic                    # one of: openai, anthropic, gemini
-  model: claude-sonnet-4-6              # paired with paper's claude family
+  model: claude-sonnet-4-5              # matches paper Table 1 directly
   timeout_s: 1800
 
 queries:
