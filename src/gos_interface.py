@@ -34,14 +34,23 @@ def _ensure_gos_on_path(gos_repo: str | Path) -> None:
         sys.path.insert(0, str(p))
 
 
+_PERSISTENT_LOOP: asyncio.AbstractEventLoop | None = None
+
+
 def _run(coro):
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return asyncio.run_coroutine_threadsafe(coro, loop).result()
-    except RuntimeError:
-        pass
-    return asyncio.run(coro)
+    """Run an async coro from sync code, reusing one event loop across calls.
+
+    asyncio.run() creates a new loop each call -- litellm's background
+    LoggingWorker binds to the first loop and then complains 'bound to a
+    different event loop' on later calls. Reusing a single loop fixes that.
+    """
+    global _PERSISTENT_LOOP
+    if _PERSISTENT_LOOP is None or _PERSISTENT_LOOP.is_closed():
+        _PERSISTENT_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_PERSISTENT_LOOP)
+    if _PERSISTENT_LOOP.is_running():
+        return asyncio.run_coroutine_threadsafe(coro, _PERSISTENT_LOOP).result()
+    return _PERSISTENT_LOOP.run_until_complete(coro)
 
 
 def _build_rag(gos_repo: str | Path, workspace: str | Path):
