@@ -69,6 +69,7 @@ def _harbor_run(
         "--agent", backend_to_agent.get(agent_cfg["backend"], agent_cfg["backend"]),
         "--model", agent_cfg["model"],
         "--force-build",
+        "--timeout-multiplier", str(agent_cfg.get("harbor_timeout_multiplier", 5)),
         "-p", str(task_dir),
         "-o", str(out_dir),
     ]

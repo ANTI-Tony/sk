@@ -23,7 +23,9 @@ retrieval:
 agent:
   backend: anthropic                    # one of: openai, anthropic, gemini
   model: claude-sonnet-4-5              # matches paper Table 1 directly
-  timeout_s: 1800
+  timeout_s: 1800                       # subprocess wall-clock timeout (our wrapper)
+  harbor_timeout_multiplier: 5          # multiplies harbors per-phase timeouts (default 1)
+                                        # 5x = ~15min agent, ~10min setup; raise if pptx-style tasks still cancel
 
 queries:
   selection_seed: 20260425
