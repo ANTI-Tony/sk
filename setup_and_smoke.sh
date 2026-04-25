@@ -146,8 +146,10 @@ if [ -d data/gos_workspace/skills_200_v1 ] && [ "$(ls data/gos_workspace/skills_
 else
     URL_HF="https://huggingface.co/datasets/DLPenn/graph-of-skills-data/resolve/main/gos_workspace_skills_200_v1.tar.gz"
     URL_MIRROR="https://hf-mirror.com/datasets/DLPenn/graph-of-skills-data/resolve/main/gos_workspace_skills_200_v1.tar.gz"
-    if ! curl -fL --retry 2 --max-time 600 -o /tmp/ws.tar.gz "$URL_HF" 2>/dev/null; then
-        curl -fL --retry 2 --max-time 600 -o /tmp/ws.tar.gz "$URL_MIRROR"
+    echo ">>> Downloading workspace (try direct HF, fall back to hf-mirror)..."
+    if ! curl -fL --retry 1 --connect-timeout 10 --max-time 900 -o /tmp/ws.tar.gz "$URL_HF"; then
+        echo ">>> Direct HF failed/slow, switching to hf-mirror..."
+        curl -fL --retry 2 --connect-timeout 10 --max-time 900 -o /tmp/ws.tar.gz "$URL_MIRROR"
     fi
     [ -s /tmp/ws.tar.gz ] || { echo "ERROR: workspace download empty" >&2; exit 1; }
     tar xzf /tmp/ws.tar.gz -C data/gos_workspace/
@@ -159,8 +161,10 @@ if [ -d evaluation/skillsbench/tasks ] && [ "$(ls evaluation/skillsbench/tasks |
 else
     URL_GH="https://github.com/benchflow-ai/skillsbench/archive/refs/heads/main.tar.gz"
     URL_MIRROR="https://gh-proxy.com/https://github.com/benchflow-ai/skillsbench/archive/refs/heads/main.tar.gz"
-    if ! curl -fL --retry 2 --max-time 1800 -o /tmp/sb.tar.gz "$URL_GH" 2>/dev/null; then
-        curl -fL --retry 2 --max-time 1800 -o /tmp/sb.tar.gz "$URL_MIRROR"
+    echo ">>> Downloading SkillsBench tasks ~580MB (try direct GH, fall back to gh-proxy)..."
+    if ! curl -fL --retry 1 --connect-timeout 10 --max-time 1800 -o /tmp/sb.tar.gz "$URL_GH"; then
+        echo ">>> Direct GitHub failed/slow, switching to gh-proxy..."
+        curl -fL --retry 2 --connect-timeout 10 --max-time 1800 -o /tmp/sb.tar.gz "$URL_MIRROR"
     fi
     [ -s /tmp/sb.tar.gz ] || { echo "ERROR: skillsbench download empty" >&2; exit 1; }
     tar xzf /tmp/sb.tar.gz -C /tmp/
