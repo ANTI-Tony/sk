@@ -264,17 +264,25 @@ PY
 # ============================================================
 step 8 "Run smoke test (4 rollouts)"
 # ============================================================
-mkdir -p results
-> results/runs.jsonl
+# Resolve the actual results dir from experiment.yaml so the file we wipe
+# and the file run_experiment.py writes to are the same one. Hardcoding
+# "results/runs.jsonl" silently diverges from yaml's paths.results_dir
+# (e.g. /tmp/gos-sanity-results) -- the smoke run then writes to one path
+# while step 9 reads an empty file at another path.
+RESULTS_DIR=$(python3 -c "import yaml,os; p=yaml.safe_load(open('configs/experiment.yaml'))['paths']['results_dir']; print(os.path.expanduser(p))")
+mkdir -p "$RESULTS_DIR"
+> "$RESULTS_DIR/runs.jsonl"
+echo "smoke test output -> $RESULTS_DIR/runs.jsonl"
 python scripts/run_experiment.py 2>&1 | tee /tmp/smoke.log
 
 # ============================================================
 step 9 "Token / cost extrapolation for full 80-run experiment"
 # ============================================================
-python3 - <<'PY'
-import json, pathlib
-runs = [json.loads(l) for l in pathlib.Path('results/runs.jsonl').read_text().splitlines() if l.strip()]
-print(f"\nRuns completed: {len(runs)}")
+RESULTS_DIR="$RESULTS_DIR" python3 - <<'PY'
+import json, os, pathlib
+jsonl = pathlib.Path(os.environ['RESULTS_DIR']) / 'runs.jsonl'
+runs = [json.loads(l) for l in jsonl.read_text().splitlines() if l.strip()]
+print(f"\nRuns completed: {len(runs)}  (jsonl: {jsonl})")
 for r in runs:
     print(f"  {r['bundle_type']:20s} reward={r.get('reward')} tokens={r.get('token_count')} time={r['execution_time']:.1f}s err={r.get('error_type')}")
 toks = [r['token_count'] for r in runs if r.get('token_count')]
@@ -297,5 +305,5 @@ else:
 PY
 
 echo ""
-echo "Smoke test done. Results at $SANITY_DIR/results/runs.jsonl"
+echo "Smoke test done. Results at $RESULTS_DIR/runs.jsonl"
 echo "Plot will be written by: python scripts/analyze.py"
