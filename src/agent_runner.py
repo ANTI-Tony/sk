@@ -80,13 +80,30 @@ def _harbor_run(
 
 
 def _read_harbor_result(out_dir: Path) -> dict:
-    """Return verifier_result + agent_result blob from harbor's output.json."""
+    """Return the per-trial result blob written by harbor.
+
+    Harbor writes two ``result.json`` files under ``out_dir``:
+
+      out_dir/<ts>/result.json                 # batch summary (stats only)
+      out_dir/<ts>/<trial_name>/result.json    # per-trial (verifier_result, agent_result)
+
+    We want the latter. The previous implementation picked it by directory
+    depth (``c.parent.parent == out_dir``); that couples to harbor's internal
+    layout and silently picks the batch summary if harbor ever changes the
+    nesting. Pick by payload schema instead -- the per-trial file is the one
+    that actually carries ``verifier_result`` / ``agent_result`` keys.
+    """
     candidates = list(out_dir.glob("**/result.json"))
     if not candidates:
         return {}
-    trial_results = [c for c in candidates if c.parent.parent == out_dir]
-    chosen = trial_results[0] if trial_results else candidates[0]
-    return json.loads(chosen.read_text())
+    for c in candidates:
+        try:
+            data = json.loads(c.read_text())
+        except json.JSONDecodeError:
+            continue
+        if "verifier_result" in data or "agent_result" in data:
+            return data
+    return json.loads(candidates[0].read_text())
 
 
 def _classify_error(payload: dict, harbor_stderr: str) -> str | None:
