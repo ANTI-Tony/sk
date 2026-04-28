@@ -118,6 +118,29 @@ def load_library(gos_repo: str | Path, library_path: str | Path) -> dict[str, Sk
     }
 
 
+def _skill_id_of(retrieved_skill) -> str:
+    """Recover the skill_id (= skills_200 directory slug) from a RetrievedSkill.
+
+    GoS's ``RetrievedSkill.name`` carries whatever the SKILL.md ``name:`` field
+    declares. For some packages that's the directory slug (e.g. ``xlsx``); for
+    others it's a human-readable display name (e.g.
+    ``Automatic Speech Recognition (ASR)``). The downstream ``_stage_bundle``
+    in ``agent_runner.py`` symlinks ``skills_library/<skill_id>``, which
+    requires the slug -- using ``s.name`` raises ``FileNotFoundError`` for any
+    bundle containing a display-name-style skill.
+
+    ``source_path`` always points at the SKILL.md file inside the package dir,
+    so its parent name is the slug for every skill.
+    """
+    sp = getattr(retrieved_skill, "source_path", None)
+    if not sp:
+        raise RuntimeError(
+            f"RetrievedSkill missing source_path; cannot recover skill_id "
+            f"(name={getattr(retrieved_skill, 'name', '?')!r})"
+        )
+    return Path(sp).parent.name
+
+
 def retrieve(
     query: str,
     gos_repo: str | Path,
@@ -132,12 +155,12 @@ def retrieve(
     bundle_res = _run(rag.async_retrieve(
         query, top_n=top_n, max_context_chars=max_context_chars,
     ))
-    bundle = [s.name for s in bundle_res.skills]
+    bundle = [_skill_id_of(s) for s in bundle_res.skills]
 
     full_res = _run(rag.async_retrieve(
         query, top_n=_FULL_TOPN, max_context_chars=_FULL_CTX_CHARS,
     ))
-    ppr = {s.name: float(s.score) for s in full_res.skills}
+    ppr = {_skill_id_of(s): float(s.score) for s in full_res.skills}
 
     missing = set(bundle) - set(ppr)
     if missing:
