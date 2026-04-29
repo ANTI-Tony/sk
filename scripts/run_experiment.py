@@ -71,11 +71,7 @@ def main() -> None:
             cosine_max=cfg["perturbations"]["add_irrelevant_cosine_max"],
             rng=rng,
         )
-        rep = replace_similar(
-            bundle, ppr,
-            rng=rng,
-            rho_epsilon=cfg["perturbations"]["replace_similar_rho_epsilon"],
-        )
+        rep = replace_similar(bundle, ppr, rng=rng)
 
         plan = [("gos_original", bundle), ("delete_top", b_del)]
         if b_add is not None:
@@ -83,10 +79,11 @@ def main() -> None:
         else:
             print(f"[skip] {qid} add_irrelevant: no candidate below cosine_max")
         if rep is not None:
-            new_bundle, _, _ = rep
+            new_bundle, swapped_out, swapped_in, dist = rep
+            print(f"[replace_similar] {qid} {swapped_out} -> {swapped_in}  d_ppr={dist:.4f}")
             plan.append(("replace_similar", new_bundle))
         else:
-            print(f"[skip] {qid} replace_similar: no PPR-neighbor within epsilon")
+            print(f"[skip] {qid} replace_similar: empty bundle or no non-bundle peer")
 
         # 3. Run each
         for bundle_type, b in plan:

@@ -33,4 +33,6 @@ queries:
 
 perturbations:
   add_irrelevant_cosine_max: 0.20       # candidate must have cosine(query, skill) below this
-  replace_similar_rho_epsilon: 0.001    # PPR scores normalize to sum=1; epsilon is on that scale
+                                        # replace_similar takes the absolute-nearest non-bundle
+                                        # PPR neighbor (no epsilon); empirical d_ppr is logged so
+                                        # post-hoc analysis can correlate reward delta with distance.

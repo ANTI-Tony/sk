@@ -64,22 +64,23 @@ def replace_similar(
     bundle: list[str],
     ppr_scores: dict[str, float],
     rng: np.random.Generator | None = None,
-    rho_epsilon: float = 0.001,
-) -> tuple[list[str], str, str] | None:
-    """Pick a random bundle skill and swap it with its nearest non-bundle PPR
-    neighbor (within rho_epsilon).
+) -> tuple[list[str], str, str, float] | None:
+    """Pick a random bundle skill and swap it with its absolute-nearest
+    non-bundle PPR neighbor.
 
-    The diagnostic perturbation: if reward is invariant to swapping in a
-    PPR-equivalent skill, GoSs ranking has no fine-grained signal above the
+    The diagnostic perturbation: if reward is invariant to swapping in the
+    closest non-bundle peer, GoSs ranking has no fine-grained signal above the
     bundle-cutoff threshold, and surrogate modeling has nothing to learn from.
+    Achieved PPR distance is returned so post-hoc analysis can correlate
+    reward delta with how "near" the swap actually was.
 
-    Returns (new_bundle, swapped_out, swapped_in) or None if no neighbor found.
+    Returns (new_bundle, swapped_out, swapped_in, ppr_distance) or None when
+    no candidate exists (empty bundle, target missing PPR, or library exhausted).
     """
     rng = rng or np.random.default_rng()
     if not bundle:
         return None
 
-    # Pick which bundle skill to replace, then find its PPR-nearest non-bundle peer.
     bundle_set = set(bundle)
     target = str(rng.choice(bundle))
     target_rho = ppr_scores.get(target)
@@ -88,13 +89,13 @@ def replace_similar(
 
     candidates = [
         (sid, rho) for sid, rho in ppr_scores.items()
-        if sid not in bundle_set and abs(rho - target_rho) <= rho_epsilon
+        if sid not in bundle_set
     ]
     if not candidates:
         return None
 
-    # Take the absolute-closest, with random tie break.
     candidates.sort(key=lambda x: (abs(x[1] - target_rho), rng.random()))
-    chosen = candidates[0][0]
+    chosen, chosen_rho = candidates[0]
+    distance = abs(chosen_rho - target_rho)
     new_bundle = [chosen if s == target else s for s in bundle]
-    return new_bundle, target, chosen
+    return new_bundle, target, chosen, distance
